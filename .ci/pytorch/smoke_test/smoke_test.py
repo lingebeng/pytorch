@@ -427,9 +427,7 @@ def smoke_test_modules():
                         f"Cloning {module['repo']} FAIL: {exc.returncode} Output: {exc.output}"
                     ) from exc
             try:
-                smoke_test_command = f"python3 {module['smoke_test']}"
-                if target_os == "windows":
-                    smoke_test_command = f"python {module['smoke_test']}"
+                smoke_test_command = f"{sys.exectuable} {module['smoke_test']}"
                 output = subprocess.check_output(
                     smoke_test_command,
                     stderr=subprocess.STDOUT,

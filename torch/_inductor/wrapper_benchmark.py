@@ -376,7 +376,7 @@ def ncu_analyzer(
 
     ncu_cmd.extend(
         [
-            "python",
+            sys.executable,
             "-c",
             python_cmd,
         ]

@@ -39,7 +39,7 @@ if __name__ == "__main__":
         TESTS = COMMON_TESTS
     for description, python_commands in TESTS:
         print(description)
-        command_args = ["python", "-c", python_commands]
+        command_args = [sys.exectuable, "-c", python_commands]
         command_string = " ".join(command_args)
         print("Command:", command_string)
         try:

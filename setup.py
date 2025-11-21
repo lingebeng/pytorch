@@ -20,7 +20,7 @@
 #     flags to apply to both C and C++ files to be compiled (a quirk of setup.py
 #     which we have faithfully adhered to in our build system is that CFLAGS
 #     also applies to C++ files (unless CXXFLAGS is set), in contrast to the
-#     default behavior of autogoo and cmake build systems.)
+#     default behavior of autotools and cmake build systems.)
 #
 #     A specific flag that can be used is
 #     -DHAS_TORCH_SHOW_DISPATCH_TRACE
@@ -229,7 +229,7 @@
 #
 #   USE_MIMALLOC
 #      Static link mimalloc into C10, and use mimalloc in alloc_cpu & alloc_free.
-#      By default, It is only enabled on Windows and AArch64.
+#      By default, it is only enabled on Windows and AArch64.
 #
 #   BUILD_LIBTORCH_WHL
 #      Builds libtorch.so and its dependencies as a wheel
@@ -617,7 +617,7 @@ def mirror_files_into_torchgen() -> None:
         if not new_path.exists():
             new_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Copy the files from the orig location to the new location
+        # Copy the files from the original location to the new location
         if orig_path.is_file():
             shutil.copyfile(orig_path, new_path)
             continue
@@ -646,7 +646,7 @@ def mirror_inductor_external_kernels() -> None:
         if not new_path.exists():
             new_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Copy the files from the orig location to the new location
+        # Copy the files from the original location to the new location
         if orig_path.is_file():
             shutil.copyfile(orig_path, new_path)
             continue
@@ -1302,7 +1302,7 @@ class build_ext(setuptools.command.build_ext.build_ext):
         # cquery does not like c++ compiles that start with gcc.
         # It forgets to include the c++ header directories.
         # We can work around this by replacing the gcc calls that python
-        # setup.py generates with g++ calls instead
+        # setup.py is generated with g++ calls instead
         for command in all_commands:
             if command["command"].startswith("gcc "):
                 command["command"] = "g++ " + command["command"][4:]
@@ -1368,7 +1368,7 @@ class bdist_wheel(setuptools.command.bdist_wheel.bdist_wheel):
         if BUILD_LIBTORCH_WHL:
             assert self.bdist_dir is not None
             bdist_dir = Path(self.bdist_dir)
-            # Remove extraneneous files in the libtorch wheel
+            # Remove extraneous files in the libtorch wheel
             for file in itertools.chain(
                 bdist_dir.rglob("*.a"),
                 bdist_dir.rglob("*.so"),
@@ -1540,7 +1540,7 @@ def configure_extension_build() -> tuple[
     ext_modules: list[Extension] = []
     # packages that we want to install into site-packages and include them in wheels
     includes = ["torch", "torch.*", "torchgen", "torchgen.*"]
-    # exclude folders that they look like Python packages but are not wanted in wheels
+    # exclude folders that look like Python packages but are not wanted in wheels
     excludes = ["tools", "tools.*", "caffe2", "caffe2.*"]
     if cmake_cache_vars["BUILD_FUNCTORCH"]:
         includes.extend(["functorch", "functorch.*"])

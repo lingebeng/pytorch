@@ -2,6 +2,7 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/Pool.h>
 #include <ATen/native/mps/OperationUtils.h>
+#include <ATen/native/mps/kernels/AdaptivePooling.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -20,7 +21,15 @@
 #include <ATen/ops/mul.h>
 #include <ATen/ops/ones_like.h>
 #endif
+
 namespace at::native {
+
+#ifndef PYTORCH_JIT_COMPILE_SHADERS
+static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
+#else
+#include <ATen/native/mps/AdaptivePooling_metallib.h>
+#endif
+
 namespace mps {
 static void set_kernel_params(int64_t isizeH,
                               int64_t isizeW,
@@ -57,6 +66,17 @@ static void set_kernel_params(int64_t isizeH,
     kernel_sizeW = osizeW - (isizeW - 1) * strideW;
   }
 }
+
+// Check if we can use the optimized path (divisible sizes)
+static bool can_use_fast_path(int64_t isizeH, int64_t isizeW, int64_t osizeH, int64_t osizeW) {
+  if (isizeH >= osizeH && isizeW >= osizeW) {
+    return (isizeH % osizeH == 0) && (isizeW % osizeW == 0);
+  } else if (isizeH <= osizeH && isizeW <= osizeW) {
+    return (osizeH % isizeH == 0) && (osizeW % isizeW == 0);
+  }
+  return false;
+}
+
 } // namespace mps
 
 // Adaptive average pooling
@@ -178,7 +198,7 @@ Tensor adaptive_avg_pool2d_backward_mps(const Tensor& gradOutput, const Tensor& 
   return gradInput;
 }
 
-// Adaptive max pooling
+// Adaptive max pooling - using custom Metal kernel for proper adaptive pooling support
 TORCH_IMPL_FUNC(adaptive_max_pool2d_out_mps)
 (const Tensor& input, IntArrayRef output_size, const Tensor& output, const Tensor& indices) {
   for (int64_t i = 1; i < input.ndimension(); i++) {
@@ -197,19 +217,72 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_out_mps)
   int64_t osizeH = output_size[0];
   int64_t osizeW = output_size[1];
 
-  int64_t strideH = 0, strideW = 0;
-  int64_t kernel_sizeH = 0, kernel_sizeW = 0;
+  // For divisible sizes, we can use the optimized max_pool2d path
+  if (mps::can_use_fast_path(isizeH, isizeW, osizeH, osizeW)) {
+    int64_t strideH = 0, strideW = 0;
+    int64_t kernel_sizeH = 0, kernel_sizeW = 0;
+    mps::set_kernel_params(isizeH, isizeW, osizeH, osizeW, strideH, strideW, kernel_sizeH, kernel_sizeW);
 
-  mps::set_kernel_params(isizeH, isizeW, osizeH, osizeW, strideH, strideW, kernel_sizeH, kernel_sizeW);
+    at::max_pool2d_with_indices_out(const_cast<Tensor&>(output),
+                                    const_cast<Tensor&>(indices),
+                                    input,
+                                    IntArrayRef({kernel_sizeH, kernel_sizeW}),
+                                    IntArrayRef({strideH, strideW}),
+                                    IntArrayRef({0, 0}),
+                                    IntArrayRef({1, 1}),
+                                    false);
+    return;
+  }
 
-  at::max_pool2d_with_indices_out(const_cast<Tensor&>(output),
-                                  const_cast<Tensor&>(indices),
-                                  input,
-                                  IntArrayRef({kernel_sizeH, kernel_sizeW}),
-                                  IntArrayRef({strideH, strideW}),
-                                  IntArrayRef({0, 0}),
-                                  IntArrayRef({1, 1}),
-                                  false);
+  // For non-divisible sizes, use our custom adaptive pooling kernel
+  // This implements the true adaptive pooling algorithm where each output element
+  // may have a different sized input window
+
+  int64_t ndim = input.ndimension();
+  // Treat batch and channels as one dimension for simplicity
+  int64_t channels = ndim == 3 ? input.size(0) : input.size(0) * input.size(1);
+
+  // Ensure input is contiguous for the kernel
+  Tensor input_contiguous = input.contiguous();
+
+  // Total number of output elements
+  int64_t numThreads = channels * osizeH * osizeW;
+
+  // Prepare kernel parameters
+  AdaptiveMaxPoolParams<int32_t> params;
+  params.dims = static_cast<int32_t>(ndim);
+  params.channels = static_cast<int32_t>(channels);
+  params.input_height = static_cast<int32_t>(isizeH);
+  params.input_width = static_cast<int32_t>(isizeW);
+  params.output_height = static_cast<int32_t>(osizeH);
+  params.output_width = static_cast<int32_t>(osizeW);
+
+  // For contiguous tensors, strides are simple
+  params.input_stride_n = static_cast<int32_t>(isizeH * isizeW);
+  params.input_stride_h = static_cast<int32_t>(isizeW);
+  params.input_stride_w = 1;
+  params.output_stride_n = static_cast<int32_t>(osizeH * osizeW);
+  params.output_stride_h = static_cast<int32_t>(osizeW);
+  params.output_stride_w = 1;
+  params.indices_stride_n = static_cast<int32_t>(osizeH * osizeW);
+  params.indices_stride_h = static_cast<int32_t>(osizeW);
+  params.indices_stride_w = 1;
+
+  using namespace mps;
+  MPSStream* mpsStream = getCurrentMPSStream();
+
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      auto kernelPSO = lib.getPipelineStateForFunc("adaptive_max_pool2d_" + scalarToMetalTypeString(input_contiguous));
+
+      getMPSProfiler().beginProfileKernel(kernelPSO, "adaptive_max_pool2d", {input_contiguous});
+      [computeEncoder setComputePipelineState:kernelPSO];
+      mtl_setArgs(computeEncoder, input_contiguous, output, indices, params);
+      mtl_dispatch1DJob(computeEncoder, kernelPSO, static_cast<uint64_t>(numThreads));
+      getMPSProfiler().endProfileKernel(kernelPSO);
+    }
+  });
 }
 
 TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_mps)
@@ -219,20 +292,69 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_mps)
   int64_t osizeH = gradOutput.size(-2);
   int64_t osizeW = gradOutput.size(-1);
 
-  int64_t strideH = 0, strideW = 0;
-  int64_t kernel_sizeH = 0, kernel_sizeW = 0;
+  // For divisible sizes, use the optimized path
+  if (mps::can_use_fast_path(isizeH, isizeW, osizeH, osizeW)) {
+    int64_t strideH = 0, strideW = 0;
+    int64_t kernel_sizeH = 0, kernel_sizeW = 0;
+    mps::set_kernel_params(isizeH, isizeW, osizeH, osizeW, strideH, strideW, kernel_sizeH, kernel_sizeW);
 
-  mps::set_kernel_params(isizeH, isizeW, osizeH, osizeW, strideH, strideW, kernel_sizeH, kernel_sizeW);
+    at::max_pool2d_with_indices_backward_out(const_cast<Tensor&>(gradInput),
+                                             gradOutput,
+                                             input,
+                                             IntArrayRef({kernel_sizeH, kernel_sizeW}),
+                                             IntArrayRef({strideH, strideW}),
+                                             IntArrayRef({0, 0}),
+                                             IntArrayRef({1, 1}),
+                                             false,
+                                             indices);
+    return;
+  }
 
-  at::max_pool2d_with_indices_backward_out(const_cast<Tensor&>(gradInput),
-                                           gradOutput,
-                                           input,
-                                           IntArrayRef({kernel_sizeH, kernel_sizeW}),
-                                           IntArrayRef({strideH, strideW}),
-                                           IntArrayRef({0, 0}),
-                                           IntArrayRef({1, 1}),
-                                           false,
-                                           indices);
+  // For non-divisible sizes, use custom kernel
+  int64_t ndim = input.ndimension();
+  int64_t channels = ndim == 3 ? input.size(0) : input.size(0) * input.size(1);
+
+  // Zero out gradInput
+  const_cast<Tensor&>(gradInput).zero_();
+
+  // Ensure tensors are contiguous
+  Tensor gradOutput_contiguous = gradOutput.contiguous();
+  Tensor indices_contiguous = indices.contiguous();
+
+  int64_t numThreads = channels * osizeH * osizeW;
+
+  AdaptiveMaxPoolBackwardParams<int32_t> params;
+  params.dims = static_cast<int32_t>(ndim);
+  params.channels = static_cast<int32_t>(channels);
+  params.input_height = static_cast<int32_t>(isizeH);
+  params.input_width = static_cast<int32_t>(isizeW);
+  params.output_height = static_cast<int32_t>(osizeH);
+  params.output_width = static_cast<int32_t>(osizeW);
+  params.grad_input_stride_n = static_cast<int32_t>(isizeH * isizeW);
+  params.grad_input_stride_h = static_cast<int32_t>(isizeW);
+  params.grad_input_stride_w = 1;
+  params.grad_output_stride_n = static_cast<int32_t>(osizeH * osizeW);
+  params.grad_output_stride_h = static_cast<int32_t>(osizeW);
+  params.grad_output_stride_w = 1;
+  params.indices_stride_n = static_cast<int32_t>(osizeH * osizeW);
+  params.indices_stride_h = static_cast<int32_t>(osizeW);
+  params.indices_stride_w = 1;
+
+  using namespace mps;
+  MPSStream* mpsStream = getCurrentMPSStream();
+
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      auto kernelPSO = lib.getPipelineStateForFunc("adaptive_max_pool2d_backward_" + scalarToMetalTypeString(input));
+
+      getMPSProfiler().beginProfileKernel(kernelPSO, "adaptive_max_pool2d_backward", {gradOutput_contiguous});
+      [computeEncoder setComputePipelineState:kernelPSO];
+      mtl_setArgs(computeEncoder, gradInput, gradOutput_contiguous, indices_contiguous, params);
+      mtl_dispatch1DJob(computeEncoder, kernelPSO, static_cast<uint64_t>(numThreads));
+      getMPSProfiler().endProfileKernel(kernelPSO);
+    }
+  });
 }
 
 } // namespace at::native
